@@ -1,10 +1,37 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+}
+
+// Helper function to validate URL format
+function isValidUrl(string: string): boolean {
+  try {
+    new URL(string);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Helper function to update source status
+async function updateSourceStatus(sourceId: string, status: string, errorMessage?: string) {
+  const supabaseClient = createClient(
+    Deno.env.get('SUPABASE_URL') ?? '',
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+  )
+
+  const updateData: any = { processing_status: status }
+  if (errorMessage) {
+    updateData.metadata = { error: errorMessage }
+  }
+
+  await supabaseClient
+    .from('sources')
+    .update(updateData)
+    .eq('id', sourceId)
 }
 
 serve(async (req) => {
@@ -30,21 +57,25 @@ serve(async (req) => {
 
     if (!webhookUrl) {
       console.error('Missing DOCUMENT_PROCESSING_WEBHOOK_URL environment variable')
+      const errorMessage = 'Document processing webhook URL not configured. Please set DOCUMENT_PROCESSING_WEBHOOK_URL in Supabase Edge Function secrets.'
       
-      // Initialize Supabase client to update status
-      const supabaseClient = createClient(
-        Deno.env.get('SUPABASE_URL') ?? '',
-        Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-      )
-
-      // Update source status to failed
-      await supabaseClient
-        .from('sources')
-        .update({ processing_status: 'failed' })
-        .eq('id', sourceId)
+      await updateSourceStatus(sourceId, 'failed', errorMessage)
 
       return new Response(
-        JSON.stringify({ error: 'Document processing webhook URL not configured' }),
+        JSON.stringify({ error: errorMessage }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
+    // Validate webhook URL format
+    if (!isValidUrl(webhookUrl)) {
+      console.error('Invalid DOCUMENT_PROCESSING_WEBHOOK_URL format:', webhookUrl)
+      const errorMessage = `Invalid webhook URL format: ${webhookUrl}. Please ensure the URL includes the protocol (https://) and is properly formatted.`
+      
+      await updateSourceStatus(sourceId, 'failed', errorMessage)
+
+      return new Response(
+        JSON.stringify({ error: errorMessage }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -74,30 +105,44 @@ serve(async (req) => {
       headers['Authorization'] = authHeader
     }
 
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify(payload)
-    })
+    let response;
+    try {
+      response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(payload)
+      })
+    } catch (fetchError) {
+      console.error('Network error calling webhook:', fetchError);
+      const errorMessage = `Failed to connect to webhook URL: ${webhookUrl}. Please verify the URL is correct and accessible.`
+      
+      await updateSourceStatus(sourceId, 'failed', errorMessage)
+
+      return new Response(
+        JSON.stringify({ 
+          error: 'Document processing failed', 
+          details: errorMessage,
+          webhookUrl: webhookUrl 
+        }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error('Webhook call failed:', response.status, errorText);
+      console.error('Webhook call failed:', response.status, response.statusText, errorText);
       
-      // Initialize Supabase client to update status
-      const supabaseClient = createClient(
-        Deno.env.get('SUPABASE_URL') ?? '',
-        Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-      )
-
-      // Update source status to failed
-      await supabaseClient
-        .from('sources')
-        .update({ processing_status: 'failed' })
-        .eq('id', sourceId)
+      const errorMessage = `Webhook returned ${response.status} ${response.statusText}: ${errorText}`
+      await updateSourceStatus(sourceId, 'failed', errorMessage)
 
       return new Response(
-        JSON.stringify({ error: 'Document processing failed', details: errorText }),
+        JSON.stringify({ 
+          error: 'Document processing failed', 
+          details: errorMessage,
+          webhookUrl: webhookUrl,
+          status: response.status,
+          statusText: response.statusText
+        }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -112,8 +157,19 @@ serve(async (req) => {
 
   } catch (error) {
     console.error('Error in process-document function:', error)
+    
+    // Try to update source status if we have the sourceId
+    try {
+      const { sourceId } = await req.clone().json()
+      if (sourceId) {
+        await updateSourceStatus(sourceId, 'failed', 'Internal server error during document processing')
+      }
+    } catch (parseError) {
+      console.error('Could not parse request to update source status:', parseError)
+    }
+
     return new Response(
-      JSON.stringify({ error: 'Internal server error' }),
+      JSON.stringify({ error: 'Internal server error', details: error.message }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     )
   }
